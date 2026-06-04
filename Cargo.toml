@@ -1,0 +1,6 @@
+[package]
+name = "ternary-ecosystem"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Full ecosystem simulation with multiple ternary species and food webs"
