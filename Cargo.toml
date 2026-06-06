@@ -2,5 +2,6 @@
 name = "ternary-ecosystem"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "Full ecosystem simulation with multiple ternary species and food webs"
+description = "Emergent behavior from local Z₃ interactions. Multiple agent species (producers, consumers, decomposers) interacting via ternary signals. Tests: does a stable ecosystem emerge?"
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/ternary-ecosystem"
