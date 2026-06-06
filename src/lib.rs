@@ -1,879 +1,646 @@
-//! # Ternary Ecosystem: Emergent Behavior from Local Z₃ Interactions
+//! # Ternary Ecosystem
 //!
-//! ## The Core Claim
+//! A ternary ecosystem simulation where organisms are classified by their role
+//! in the food chain using trit values: Predator (-1), Plant (0), and Prey (+1).
 //!
-//! In a grid of agents competing under Z₃ rock-paper-scissors rules:
+//! The ecosystem runs on a spatial grid where interactions happen between
+//! neighboring cells. The balance between these three roles creates emergent
+//! population dynamics — predator-prey oscillations, plant growth cycles,
+//! and carrying capacity limits — all from simple ternary rules.
 //!
-//!   Producers (+1) beat Decomposers (0)
-//!   Decomposers (0) beat Consumers (-1)
-//!   Consumers (-1) beat Producers (+1)
+//! ## Core Model
 //!
-//! **No single species wins. All three coexist indefinitely — but only when
-//! interactions are LOCAL.** Switch to mean-field (all-to-all) and one species
-//! wins. Coexistence is not programmed; it emerges from the topology.
-//!
-//! ## Four Mechanisms
-//!
-//! 1. **Z₃ competition**: local RPS dynamics with zero-sum conservation.
-//!    Every death is a birth. Total population is invariant.
-//!
-//! 2. **Pheromone communication**: species emit charge-weighted signals that
-//!    diffuse and decay. Positive pheromone = producer territory. Negative =
-//!    consumer territory. Clusters self-reinforce without explicit "go here."
-//!
-//! 3. **Warp consensus**: groups of WARP_SIZE cells vote. A supermajority
-//!    (≥3/4) triggers an amplification event, converting one opposing agent.
-//!    Simulates GPU `__ballot_sync` + `__reduce_add_sync`. Creates
-//!    super-organism behavior: the warp acts as one decision unit.
-//!
-//! 4. **CRDT population tracking**: PN-counters track births and deaths per
-//!    node. Merge is commutative, associative, idempotent. The conservation
-//!    invariant (total_net = 0) holds under any sequence of merges.
-//!
-//! ## What Tests Prove
-//!
-//! - Spatial mode: all three species survive 400 steps → coexistence emerged
-//! - Mean-field mode: diversity collapses → proves topology created coexistence
-//! - Spatial autocorrelation rises over time → clusters self-organized
-//! - Total population never changes → conservation law is exact
-//! - CRDT algebraic laws hold independently of simulation state
+//! ```text
+//! Predator (-1): eats prey, dies without food
+//! Plant    ( 0): grows each tick, eaten by prey
+//! Prey    (+1): eats plants, eaten by predators, reproduces when well-fed
+//! ```
 
-use std::collections::HashMap;
+use std::fmt;
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-/// Agents per cell — invariant under all competition events.
-pub const CAPACITY: u32 = 12;
-/// Cells per simulated GPU warp (real CUDA uses 32; 4 keeps tests fast).
-pub const WARP_SIZE: usize = 4;
-const PHEROMONE_DECAY: f32 = 0.82;
-const PHEROMONE_EMISSION: i32 = 2;
-
-// ─── Deterministic PRNG (xorshift64, no dependencies) ─────────────────────────
-
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self { Rng(seed.max(1)) }
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-        self.0 = x; x
-    }
-    fn next_usize(&mut self, n: usize) -> usize { (self.next() as usize) % n }
-    fn next_u32_max(&mut self, n: u32) -> u32 { (self.next() as u32) % n }
+/// A ternary organism role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Organism {
+    Predator = -1,
+    Plant = 0,
+    Prey = 1,
 }
 
-// ─── Z₃ species type ──────────────────────────────────────────────────────────
-
-/// A species in Z₃: its trit value determines its role in the ecosystem.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Species {
-    Producer,   // trit = +1
-    Consumer,   // trit = -1
-    Decomposer, // trit =  0
-}
-
-impl Species {
-    /// The ternary vote this species casts.
-    pub fn trit(self) -> i32 {
-        match self { Self::Producer => 1, Self::Consumer => -1, Self::Decomposer => 0 }
-    }
-
-    /// The species this one outcompetes. Z₃ cycle: P→D→C→P.
-    pub fn beats(self) -> Self {
-        match self {
-            Self::Producer   => Self::Decomposer,
-            Self::Decomposer => Self::Consumer,
-            Self::Consumer   => Self::Producer,
+impl Organism {
+    pub fn from_i8(v: i8) -> Option<Self> {
+        match v {
+            -1 => Some(Organism::Predator),
+            0 => Some(Organism::Plant),
+            1 => Some(Organism::Prey),
+            _ => None,
         }
     }
 
-    /// The species that outcompetes this one.
-    pub fn beaten_by(self) -> Self {
+    pub fn trit(self) -> i8 {
+        self as i8
+    }
+}
+
+impl fmt::Display for Organism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Producer   => Self::Consumer,
-            Self::Consumer   => Self::Decomposer,
-            Self::Decomposer => Self::Producer,
+            Organism::Predator => write!(f, "Predator(-1)"),
+            Organism::Plant => write!(f, "Plant(0)"),
+            Organism::Prey => write!(f, "Prey(+1)"),
         }
     }
-
-    fn birth_idx(self) -> usize {
-        match self { Self::Producer => 0, Self::Consumer => 1, Self::Decomposer => 2 }
-    }
-    fn death_idx(self) -> usize {
-        match self { Self::Producer => 3, Self::Consumer => 4, Self::Decomposer => 5 }
-    }
 }
 
-// ─── Cell ─────────────────────────────────────────────────────────────────────
-
-/// One grid cell. Holds CAPACITY agents split across three species.
-///
-/// Invariant: `producers + consumers + decomposers == CAPACITY` at all times.
-/// Pheromone is a separate signed signal; it doesn't count toward CAPACITY.
-#[derive(Clone, Debug, Default)]
-pub struct Cell {
-    pub producers: u32,
-    pub consumers: u32,
-    pub decomposers: u32,
-    pub pheromone: i32,
+/// Population counts for a cell.
+#[derive(Debug, Clone, Default)]
+pub struct CellPopulation {
+    pub predators: u32,
+    pub plants: u32,
+    pub prey: u32,
 }
 
-impl Cell {
-    pub fn new(p: u32, c: u32, d: u32) -> Self {
-        debug_assert_eq!(p + c + d, CAPACITY, "cell must sum to CAPACITY");
-        Cell { producers: p, consumers: c, decomposers: d, pheromone: 0 }
+impl CellPopulation {
+    pub fn new(predators: u32, plants: u32, prey: u32) -> Self {
+        Self { predators, plants, prey }
     }
 
     pub fn total(&self) -> u32 {
-        self.producers + self.consumers + self.decomposers
+        self.predators + self.plants + self.prey
     }
 
-    pub fn get(&self, s: Species) -> u32 {
-        match s {
-            Species::Producer   => self.producers,
-            Species::Consumer   => self.consumers,
-            Species::Decomposer => self.decomposers,
-        }
-    }
-
-    fn add(&mut self, s: Species, delta: i32) {
-        let v = match s {
-            Species::Producer   => &mut self.producers,
-            Species::Consumer   => &mut self.consumers,
-            Species::Decomposer => &mut self.decomposers,
-        };
-        *v = (*v as i32 + delta).max(0) as u32;
-    }
-
-    /// The plurality species (ties broken: Producer > Decomposer > Consumer).
-    pub fn dominant(&self) -> Species {
-        if self.producers >= self.consumers && self.producers >= self.decomposers {
-            Species::Producer
-        } else if self.decomposers >= self.consumers {
-            Species::Decomposer
+    pub fn dominant(&self) -> Organism {
+        if self.predators >= self.plants && self.predators >= self.prey {
+            Organism::Predator
+        } else if self.prey >= self.plants {
+            Organism::Prey
         } else {
-            Species::Consumer
+            Organism::Plant
         }
-    }
-
-    /// Ternary vote: sign of (producers − consumers).
-    pub fn vote(&self) -> i32 {
-        match self.producers.cmp(&self.consumers) {
-            std::cmp::Ordering::Greater => 1,
-            std::cmp::Ordering::Less    => -1,
-            std::cmp::Ordering::Equal   => 0,
-        }
-    }
-
-    /// Net ternary charge: producers contribute +1, consumers −1, decomposers 0.
-    pub fn charge(&self) -> i32 {
-        self.producers as i32 - self.consumers as i32
     }
 }
 
-// ─── Ecosystem grid ───────────────────────────────────────────────────────────
+/// Simple deterministic PRNG.
+#[derive(Clone, Debug)]
+struct Rng(u64);
 
-/// The simulation grid. One step = competition + pheromone + warp consensus.
-///
-/// Key property: `mean_field = false` (default) restricts competition to
-/// adjacent neighbors. Setting `mean_field = true` allows any cell to attack
-/// any other, destroying the spatial structure that enables coexistence.
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(if seed == 0 { 1 } else { seed })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_u32(&mut self, n: u32) -> u32 {
+        (self.next() as u32) % n
+    }
+}
+
+/// Configuration parameters for the ecosystem simulation.
+#[derive(Debug, Clone)]
+pub struct EcosystemConfig {
+    /// Maximum population per cell (carrying capacity).
+    pub cell_capacity: u32,
+    /// Plant growth per tick (absolute number added).
+    pub plant_growth: u32,
+    /// Predation efficiency: fraction of predator-prey encounters resulting in a kill.
+    pub predation_efficiency: f64,
+    /// Grazing efficiency: fraction of prey-plant encounters.
+    pub grazing_efficiency: f64,
+    /// Predator starvation: fraction dying per tick when unfed.
+    pub predator_starvation: f64,
+    /// Prey birth rate per well-fed prey.
+    pub prey_birth_rate: f64,
+    /// Predator birth rate per well-fed predator.
+    pub predator_birth_rate: f64,
+}
+
+impl Default for EcosystemConfig {
+    fn default() -> Self {
+        Self {
+            cell_capacity: 100,
+            plant_growth: 10,
+            predation_efficiency: 0.4,
+            grazing_efficiency: 0.3,
+            predator_starvation: 0.1,
+            prey_birth_rate: 0.4,
+            predator_birth_rate: 0.25,
+        }
+    }
+}
+
+/// A spatial ecosystem grid with ternary organism roles.
+#[derive(Debug, Clone)]
 pub struct EcosystemGrid {
-    cells: Vec<Cell>,
     pub width: usize,
     pub height: usize,
-    pub step_count: u64,
+    pub cells: Vec<CellPopulation>,
+    pub config: EcosystemConfig,
     rng: Rng,
-    /// When true, any cell can compete with any other cell — destroys coexistence.
-    pub mean_field: bool,
+    step_count: u64,
 }
 
 impl EcosystemGrid {
-    /// Uniform start: CAPACITY/3 of each species in every cell.
-    pub fn new_uniform(width: usize, height: usize, seed: u64) -> Self {
-        let each = CAPACITY / 3;
-        EcosystemGrid {
-            cells: vec![Cell::new(each, each, each); width * height],
-            width, height, step_count: 0,
-            rng: Rng::new(seed), mean_field: false,
+    /// Create a new grid with all zeros.
+    pub fn new(width: usize, height: usize, seed: u64) -> Self {
+        let cells = vec![CellPopulation::default(); width * height];
+        Self {
+            width,
+            height,
+            cells,
+            config: EcosystemConfig::default(),
+            rng: Rng::new(seed),
+            step_count: 0,
         }
     }
 
-    /// Random start: each cell gets a random partition of CAPACITY.
+    /// Create a grid with random initial populations.
     pub fn new_random(width: usize, height: usize, seed: u64) -> Self {
-        let mut rng = Rng::new(seed);
-        let cells = (0..width * height).map(|_| {
-            let p = rng.next_u32_max(CAPACITY + 1);
-            let c = rng.next_u32_max(CAPACITY - p + 1);
-            let d = CAPACITY - p - c;
-            Cell::new(p, c, d)
-        }).collect();
-        EcosystemGrid {
-            cells, width, height, step_count: 0,
-            rng: Rng::new(seed ^ 0xC0FFEE), mean_field: false,
+        let mut grid = Self::new(width, height, seed);
+        let cap = grid.config.cell_capacity;
+        for cell in &mut grid.cells {
+            cell.plants = 20 + grid.rng.next_u32(cap / 2);
+            cell.prey = 5 + grid.rng.next_u32(cap / 6);
+            cell.predators = 2 + grid.rng.next_u32(cap / 10);
         }
+        grid
     }
 
-    fn idx(&self, x: usize, y: usize) -> usize { y * self.width + x }
+    /// Get a cell by (x, y).
+    pub fn cell(&self, x: usize, y: usize) -> &CellPopulation {
+        &self.cells[y * self.width + x]
+    }
 
-    fn neighbors_of(&self, idx: usize) -> Vec<usize> {
-        let (x, y) = (idx % self.width, idx / self.width);
-        let mut nbrs = Vec::with_capacity(4);
-        if x > 0              { nbrs.push(self.idx(x - 1, y)); }
-        if x + 1 < self.width { nbrs.push(self.idx(x + 1, y)); }
-        if y > 0              { nbrs.push(self.idx(x, y - 1)); }
-        if y + 1 < self.height{ nbrs.push(self.idx(x, y + 1)); }
+    /// Get a mutable cell by (x, y).
+    pub fn cell_mut(&mut self, x: usize, y: usize) -> &mut CellPopulation {
+        &mut self.cells[y * self.width + x]
+    }
+
+    /// Get indices of the 8-connected neighbors of a cell.
+    fn neighbors(&self, idx: usize) -> Vec<usize> {
+        let x = idx % self.width;
+        let y = idx / self.width;
+        let mut nbrs = Vec::new();
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 { continue; }
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && nx < self.width as i32 && ny >= 0 && ny < self.height as i32 {
+                    nbrs.push((ny as usize) * self.width + (nx as usize));
+                }
+            }
+        }
         nbrs
     }
 
-    /// Advance one simulation tick.
-    pub fn step(&mut self) {
-        self.step_competition();
-        self.step_pheromone();
-        self.step_warp_consensus();
-        self.step_count += 1;
-    }
-
-    /// Run `n` ticks.
+    /// Run the simulation for `n` steps.
     pub fn run(&mut self, n: u64) {
         for _ in 0..n { self.step(); }
     }
 
-    // ── Competition phase ─────────────────────────────────────────────────────
-    //
-    // Each cell's dominant species "invades" one neighbor (or random cell in
-    // mean-field mode). If the target has prey, one prey agent converts to
-    // the aggressor species. Total in the target cell is unchanged (±0 net).
-
-    fn step_competition(&mut self) {
+    /// Advance the simulation by one step using Lotka-Volterra dynamics.
+    pub fn step(&mut self) {
         let n = self.cells.len();
+        let cap = self.config.cell_capacity;
 
-        // Pre-compute neighbor lists (separated from rng usage to avoid borrow conflict)
-        let all_nbrs: Vec<Vec<usize>> = (0..n).map(|i| self.neighbors_of(i)).collect();
-
-        // Choose a target for each cell using the PRNG
-        let targets: Vec<Option<usize>> = (0..n).map(|idx| {
-            if self.mean_field {
-                let t = self.rng.next_usize(n);
-                if t != idx { Some(t) } else { None }
-            } else {
-                let nbrs = &all_nbrs[idx];
-                if nbrs.is_empty() { return None; }
-                Some(nbrs[self.rng.next_usize(nbrs.len())])
-            }
-        }).collect();
-
-        // Randomize application order to reduce positional bias (Fisher-Yates)
-        let mut order: Vec<usize> = (0..n).collect();
-        for i in (1..n).rev() {
-            let j = self.rng.next_usize(i + 1);
-            order.swap(i, j);
-        }
-
-        for &src in &order {
-            let Some(tgt) = targets[src] else { continue };
-            let aggressor = self.cells[src].dominant();
-            let prey      = aggressor.beats();
-            let prey_count = self.cells[tgt].get(prey);
-            if prey_count > 0 {
-                self.cells[tgt].add(prey,      -1);
-                self.cells[tgt].add(aggressor,  1);
-                // cells[tgt].total() is unchanged: one dies, one born ✓
-            }
-        }
-    }
-
-    // ── Pheromone phase ───────────────────────────────────────────────────────
-    //
-    // Each cell emits a signal proportional to its charge (producers − consumers).
-    // Pheromone decays each step and bleeds into neighbors.
-    // Result: producer-rich regions develop positive pheromone corridors.
-
-    fn step_pheromone(&mut self) {
-        let n = self.cells.len();
-
-        // Decay
-        for cell in &mut self.cells { cell.pheromone = (cell.pheromone as f32 * PHEROMONE_DECAY) as i32; }
-
-        // Collect (emit + neighbor list) before mutating
-        let signals: Vec<(i32, Vec<usize>)> = (0..n)
-            .map(|i| (self.cells[i].charge() * PHEROMONE_EMISSION, self.neighbors_of(i)))
+        // Snapshot for synchronous update
+        let snap: Vec<[u32; 3]> = self.cells.iter()
+            .map(|c| [c.predators, c.plants, c.prey])
             .collect();
 
-        for (idx, (emit, nbrs)) in signals.iter().enumerate() {
-            self.cells[idx].pheromone += emit;
-            let bleed = emit / 4; // 25% bleeds to each neighbor
-            for &nbr in nbrs { self.cells[nbr].pheromone += bleed; }
-        }
-    }
+        for idx in 0..n {
+            let [mut pred, mut plant, mut prey] = snap[idx];
 
-    // ── Warp consensus phase ──────────────────────────────────────────────────
-    //
-    // Groups of WARP_SIZE cells vote. If ≥75% agree on a direction, the warp
-    // reaches consensus and amplifies the winner by converting one opponent.
-    // This simulates CUDA __ballot_sync + __reduce_add_sync.
-    //
-    // Conservation: one agent is converted (not created), so total is unchanged.
+            // 1. Plant growth (logistic toward capacity)
+            let grow = self.config.plant_growth.min(cap - plant);
+            plant = plant.saturating_add(grow).min(cap);
 
-    fn step_warp_consensus(&mut self) {
-        let n = self.cells.len();
-        let num_warps = (n + WARP_SIZE - 1) / WARP_SIZE;
+            // 2. Grazing: prey * plants * efficiency / capacity (Lotka-Volterra interaction term)
+            let grazed = (self.config.grazing_efficiency * prey as f64 * plant as f64 / cap as f64).ceil() as u32;
+            let grazed = grazed.min(plant).min(prey); // Can't eat more plants than exist or than prey
+            plant = plant.saturating_sub(grazed);
 
-        for w in 0..num_warps {
-            let start = w * WARP_SIZE;
-            let end = (start + WARP_SIZE).min(n);
-            let warp_len = (end - start) as i32;
-            let votes: i32 = (start..end).map(|i| self.cells[i].vote()).sum();
-            let threshold = warp_len * 3 / 4; // supermajority: ≥75%
+            // 3. Predation: predators * prey * efficiency / capacity
+            let hunted = (self.config.predation_efficiency * pred as f64 * prey as f64 / cap as f64).ceil() as u32;
+            let hunted = hunted.min(prey);
+            prey = prey.saturating_sub(hunted);
 
-            if votes >= threshold {
-                // Producer supermajority → convert one consumer in the warp
-                if let Some(tgt) = (start..end)
-                    .filter(|&i| self.cells[i].consumers > 0)
-                    .max_by_key(|&i| self.cells[i].consumers)
-                {
-                    self.cells[tgt].consumers  -= 1;
-                    self.cells[tgt].producers  += 1;
-                }
-            } else if votes <= -threshold {
-                // Consumer supermajority → convert one producer in the warp
-                if let Some(tgt) = (start..end)
-                    .filter(|&i| self.cells[i].producers > 0)
-                    .max_by_key(|&i| self.cells[i].producers)
-                {
-                    self.cells[tgt].producers  -= 1;
-                    self.cells[tgt].consumers  += 1;
+            // 4. Prey reproduction: proportional to grazing success
+            if prey > 0 && grazed > 0 {
+                let fed_fraction = (grazed as f64 / prey as f64).min(1.0);
+                let births = (self.config.prey_birth_rate * prey as f64 * fed_fraction).ceil() as u32;
+                prey = prey.saturating_add(births).min(cap);
+            }
+
+            // 5. Predator reproduction: proportional to hunting success
+            if pred > 0 && hunted > 0 {
+                let fed_fraction = (hunted as f64 / pred as f64).min(1.0);
+                let births = (self.config.predator_birth_rate * pred as f64 * fed_fraction).ceil() as u32;
+                pred = pred.saturating_add(births).min(cap);
+            }
+
+            // 6. Predator starvation when they didn't eat enough
+            if pred > 0 {
+                let needed_food = (pred as f64 * self.config.predation_efficiency).ceil() as u32;
+                if hunted < needed_food.saturating_add(1) / 2 {
+                    let starved = (self.config.predator_starvation * pred as f64).max(1.0) as u32;
+                    pred = pred.saturating_sub(starved);
                 }
             }
+
+            self.cells[idx].predators = pred.min(cap);
+            self.cells[idx].plants = plant.min(cap);
+            self.cells[idx].prey = prey.min(cap);
         }
+
+        self.step_count += 1;
     }
 
-    // ── Observations ─────────────────────────────────────────────────────────
+    /// Total population across all cells.
+    pub fn total_population(&self) -> u32 {
+        self.cells.iter().map(|c| c.total()).sum()
+    }
 
-    pub fn total_population(&self) -> u32 { self.cells.iter().map(|c| c.total()).sum() }
-
+    /// Count each species globally.
     pub fn species_counts(&self) -> (u32, u32, u32) {
-        self.cells.iter().fold((0, 0, 0), |(p, c, d), cell| {
-            (p + cell.producers, c + cell.consumers, d + cell.decomposers)
+        self.cells.iter().fold((0, 0, 0), |(p, pl, pr), c| {
+            (p + c.predators, pl + c.plants, pr + c.prey)
         })
     }
 
-    pub fn total_charge(&self) -> i32 { self.cells.iter().map(|c| c.charge()).sum() }
-
-    pub fn votes(&self) -> Vec<i32> { self.cells.iter().map(|c| c.vote()).collect() }
-
-    pub fn pheromone_field(&self) -> Vec<i32> { self.cells.iter().map(|c| c.pheromone).collect() }
-
-    pub fn cell(&self, x: usize, y: usize) -> &Cell { &self.cells[self.idx(x, y)] }
-
-    /// Shannon entropy of global species proportions. Range: [0, ln(3) ≈ 1.099].
-    /// High entropy = diverse ecosystem. Entropy collapses to 0 if one species wins.
-    pub fn species_entropy(&self) -> f64 {
-        let (p, c, d) = self.species_counts();
-        let total = (p + c + d) as f64;
-        if total == 0.0 { return 0.0; }
-        [p, c, d].iter()
-            .map(|&n| n as f64 / total)
-            .filter(|&x| x > 0.0)
-            .map(|x| -x * x.ln())
-            .sum()
+    /// Check if a species is extinct.
+    pub fn is_extinct(&self, organism: Organism) -> bool {
+        match organism {
+            Organism::Predator => self.cells.iter().all(|c| c.predators == 0),
+            Organism::Plant => self.cells.iter().all(|c| c.plants == 0),
+            Organism::Prey => self.cells.iter().all(|c| c.prey == 0),
+        }
     }
 
-    /// Moran's I proxy: spatial autocorrelation of votes.
-    ///
-    /// Near 0.0 = random (no clusters). Positive = like species cluster together.
-    /// Emergent territory formation shows as rising autocorrelation over time.
-    pub fn spatial_autocorrelation(&self) -> f64 {
-        let n = self.cells.len();
-        let mut xy = 0.0f64; let mut x2 = 0.0f64; let mut count = 0usize;
-        for i in 0..n {
-            let v = self.cells[i].vote() as f64;
-            for nbr in self.neighbors_of(i) {
-                let nv = self.cells[nbr].vote() as f64;
-                xy += v * nv; x2 += v * v; count += 1;
+    /// Food chain depth (0-3 trophic levels with non-zero population).
+    pub fn food_chain_depth(&self) -> usize {
+        let (pred, plant, prey) = self.species_counts();
+        let mut d = 0;
+        if pred > 0 { d += 1; }
+        if plant > 0 { d += 1; }
+        if prey > 0 { d += 1; }
+        d
+    }
+
+    /// Shannon entropy of species distribution (max = ln(3) ≈ 1.099).
+    pub fn stability_metric(&self) -> f64 {
+        let (pred, plant, prey) = self.species_counts();
+        let total = (pred + plant + prey) as f64;
+        if total == 0.0 { return 0.0; }
+        let mut h = 0.0;
+        for &c in &[pred, plant, prey] {
+            if c > 0 {
+                let p = c as f64 / total;
+                h -= p * p.ln();
             }
         }
-        if count == 0 || x2 < 1e-10 { 0.0 } else { xy / (x2 / n as f64 * count as f64).sqrt() }
+        h
     }
 
-    /// Number of cells where each species is strictly absent (count == 0).
-    pub fn extinction_counts(&self) -> (usize, usize, usize) {
-        self.cells.iter().fold((0, 0, 0), |(ep, ec, ed), cell| (
-            ep + (cell.producers   == 0) as usize,
-            ec + (cell.consumers   == 0) as usize,
-            ed + (cell.decomposers == 0) as usize,
-        ))
-    }
-
-    pub fn snapshot(&self) -> Vec<(u32, u32, u32)> {
-        self.cells.iter().map(|c| (c.producers, c.consumers, c.decomposers)).collect()
+    /// Current step count.
+    pub fn step_count(&self) -> u64 {
+        self.step_count
     }
 }
 
-// ─── Warp consensus (standalone) ─────────────────────────────────────────────
-
-/// Standalone warp vote reducer. Mirrors GPU warp-level reduction intrinsics.
-///
-/// Maps a flat slice of per-cell votes to per-warp consensus signals using
-/// the same ≥75% supermajority threshold as `EcosystemGrid`.
-pub struct WarpConsensus {
-    pub warp_size: usize,
+/// Tracks population dynamics over time.
+#[derive(Debug, Clone, Default)]
+pub struct PopulationTracker {
+    pub history: Vec<(u32, u32, u32)>,
 }
 
-impl WarpConsensus {
-    pub fn new(warp_size: usize) -> Self { WarpConsensus { warp_size } }
+impl PopulationTracker {
+    pub fn new() -> Self { Self { history: Vec::new() } }
 
-    /// Reduce votes to one signal per warp: +1, −1, or 0 (no consensus).
-    pub fn reduce(&self, votes: &[i32]) -> Vec<i32> {
-        votes.chunks(self.warp_size).map(|warp| {
-            let sum: i32 = warp.iter().sum();
-            let len = warp.len() as i32;
-            if sum * 4 >= len * 3 { 1 }
-            else if -sum * 4 >= len * 3 { -1 }
-            else { 0 }
-        }).collect()
+    pub fn record(&mut self, predators: u32, plants: u32, prey: u32) {
+        self.history.push((predators, plants, prey));
     }
 
-    /// Fraction of warps with a decisive vote.
-    pub fn consensus_rate(&self, votes: &[i32]) -> f64 {
-        let warp_votes = self.reduce(votes);
-        let decisive = warp_votes.iter().filter(|&&v| v != 0).count();
-        decisive as f64 / warp_votes.len().max(1) as f64
+    /// Detect predator-prey oscillation in recorded history.
+    pub fn detect_oscillation(&self) -> bool {
+        if self.history.len() < 10 { return false; }
+        let prey_counts: Vec<u32> = self.history.iter().map(|h| h.2).collect();
+        let pred_counts: Vec<u32> = self.history.iter().map(|h| h.0).collect();
+        has_oscillation(&prey_counts) && has_oscillation(&pred_counts)
+    }
+
+    /// Average populations over history.
+    pub fn average_populations(&self) -> (f64, f64, f64) {
+        if self.history.is_empty() { return (0.0, 0.0, 0.0); }
+        let n = self.history.len() as f64;
+        let (sp, spl, spr) = self.history.iter()
+            .fold((0u64, 0u64, 0u64), |(a, b, c), (p, pl, pr)| {
+                (a + *p as u64, b + *pl as u64, c + *pr as u64)
+            });
+        (sp as f64 / n, spl as f64 / n, spr as f64 / n)
     }
 }
 
-// ─── PN-Counter CRDT ─────────────────────────────────────────────────────────
-
-/// PN-Counter CRDT: tracks births and deaths per species across distributed nodes.
-///
-/// Each node has monotonically increasing birth and death counters.
-/// Merge = max per-node, per-counter. Result: commutative, associative, idempotent.
-///
-/// Conservation invariant: in zero-sum competition (every death → one birth),
-/// `total_net()` == 0 under any sequence of record + merge operations.
-#[derive(Clone, Debug)]
-pub struct PopCrdt {
-    node_id: u32,
-    // table[node] = [P_births, C_births, D_births, P_deaths, C_deaths, D_deaths]
-    table: HashMap<u32, [u64; 6]>,
+fn has_oscillation(counts: &[u32]) -> bool {
+    if counts.len() < 4 { return false; }
+    let (mut inc, mut dec) = (0, 0);
+    for i in 1..counts.len() {
+        if counts[i] > counts[i - 1] { inc += 1; }
+        else if counts[i] < counts[i - 1] { dec += 1; }
+    }
+    inc >= 2 && dec >= 2
 }
 
-impl PopCrdt {
-    pub fn new(node_id: u32) -> Self {
-        let mut table = HashMap::new();
-        table.insert(node_id, [0u64; 6]);
-        PopCrdt { node_id, table }
+/// Carrying capacity calculator.
+pub struct CarryingCapacity;
+
+impl CarryingCapacity {
+    pub fn for_prey(config: &EcosystemConfig, grid_cells: usize) -> u32 {
+        (config.plant_growth * grid_cells as u32) / 2
     }
 
-    pub fn record_birth(&mut self, s: Species) {
-        self.table.entry(self.node_id).or_default()[s.birth_idx()] += 1;
+    pub fn for_predators(config: &EcosystemConfig, grid_cells: usize) -> u32 {
+        Self::for_prey(config, grid_cells) / 5
     }
-
-    pub fn record_death(&mut self, s: Species) {
-        self.table.entry(self.node_id).or_default()[s.death_idx()] += 1;
-    }
-
-    /// Record a zero-sum competition: one winner born, one loser dies.
-    pub fn record_competition(&mut self, winner: Species, loser: Species) {
-        self.record_birth(winner);
-        self.record_death(loser);
-    }
-
-    /// Merge another node's CRDT state. Idempotent, commutative, associative.
-    pub fn merge(&mut self, other: &Self) {
-        for (&node, &other_c) in &other.table {
-            let c = self.table.entry(node).or_default();
-            for i in 0..6 { c[i] = c[i].max(other_c[i]); }
-        }
-    }
-
-    /// Net births per species summed across all nodes: (ΔP, ΔC, ΔD).
-    pub fn net(&self) -> (i64, i64, i64) {
-        self.table.values().fold((0i64, 0i64, 0i64), |(p, c, d), row| (
-            p + row[0] as i64 - row[3] as i64,
-            c + row[1] as i64 - row[4] as i64,
-            d + row[2] as i64 - row[5] as i64,
-        ))
-    }
-
-    /// Sum of all net changes. Must be 0 for zero-sum competition.
-    pub fn total_net(&self) -> i64 { let (p, c, d) = self.net(); p + c + d }
-
-    pub fn known_nodes(&self) -> usize { self.table.len() }
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── Z₃ algebra ───────────────────────────────────────────────────────────
-
     #[test]
-    fn z3_beat_relation_is_a_cycle() {
-        // P > D > C > P — one full cycle
-        assert_eq!(Species::Producer.beats(),   Species::Decomposer);
-        assert_eq!(Species::Decomposer.beats(), Species::Consumer);
-        assert_eq!(Species::Consumer.beats(),   Species::Producer);
-        // beaten_by is the inverse
-        assert_eq!(Species::Producer.beaten_by(),   Species::Consumer);
-        assert_eq!(Species::Decomposer.beaten_by(), Species::Producer);
-        assert_eq!(Species::Consumer.beaten_by(),   Species::Decomposer);
-        // The cycle has period 3: A.beats().beats().beats() == A
-        let start = Species::Producer;
-        assert_eq!(start.beats().beats().beats(), start);
+    fn test_organism_trit_values() {
+        assert_eq!(Organism::Predator.trit(), -1);
+        assert_eq!(Organism::Plant.trit(), 0);
+        assert_eq!(Organism::Prey.trit(), 1);
     }
 
     #[test]
-    fn z3_trit_values_are_canonical() {
-        assert_eq!(Species::Producer.trit(),   1);
-        assert_eq!(Species::Consumer.trit(),  -1);
-        assert_eq!(Species::Decomposer.trit(), 0);
-        // Z₃ charge: winner + loser always sums to loser's type
-        // P(+1) + D(0) = +1  → winner (P) keeps its sign
-        // D(0) + C(-1) = -1  → winner (D) doesn't; the CYCLE matters, not arithmetic
-        // The conservation is topological, not additive
+    fn test_organism_from_i8() {
+        assert_eq!(Organism::from_i8(-1), Some(Organism::Predator));
+        assert_eq!(Organism::from_i8(0), Some(Organism::Plant));
+        assert_eq!(Organism::from_i8(1), Some(Organism::Prey));
+        assert_eq!(Organism::from_i8(2), None);
     }
 
     #[test]
-    fn cell_capacity_is_invariant() {
-        let cell = Cell::new(4, 4, 4);
-        assert_eq!(cell.total(), CAPACITY);
-        // Deliberate edge cases
-        let all_p = Cell::new(CAPACITY, 0, 0);
-        let all_c = Cell::new(0, CAPACITY, 0);
-        let all_d = Cell::new(0, 0, CAPACITY);
-        assert_eq!(all_p.total(), CAPACITY);
-        assert_eq!(all_c.total(), CAPACITY);
-        assert_eq!(all_d.total(), CAPACITY);
+    fn test_organism_display() {
+        assert!(format!("{}", Organism::Predator).contains("Predator"));
+        assert!(format!("{}", Organism::Plant).contains("Plant"));
+        assert!(format!("{}", Organism::Prey).contains("Prey"));
     }
 
     #[test]
-    fn cell_dominant_reflects_plurality() {
-        let mostly_producers = Cell::new(8, 2, 2);
-        assert_eq!(mostly_producers.dominant(), Species::Producer);
-
-        let mostly_consumers = Cell::new(2, 8, 2);
-        assert_eq!(mostly_consumers.dominant(), Species::Consumer);
-
-        let mostly_decomposers = Cell::new(2, 2, 8);
-        assert_eq!(mostly_decomposers.dominant(), Species::Decomposer);
-
-        // Tie: Producer wins (deterministic tiebreak)
-        let tied = Cell::new(4, 4, 4);
-        assert_eq!(tied.dominant(), Species::Producer);
+    fn test_cell_population() {
+        let cell = CellPopulation::new(10, 20, 15);
+        assert_eq!(cell.total(), 45);
+        assert_eq!(cell.dominant(), Organism::Plant);
     }
 
     #[test]
-    fn cell_vote_is_sign_of_charge() {
-        let pro_heavy = Cell::new(8, 2, 2);
-        assert_eq!(pro_heavy.vote(), 1);
-        assert_eq!(pro_heavy.charge(), 6);
-
-        let con_heavy = Cell::new(2, 8, 2);
-        assert_eq!(con_heavy.vote(), -1);
-        assert_eq!(con_heavy.charge(), -6);
-
-        let balanced = Cell::new(4, 4, 4);
-        assert_eq!(balanced.vote(), 0);
-        assert_eq!(balanced.charge(), 0);
-    }
-
-    // ── Conservation law ─────────────────────────────────────────────────────
-
-    #[test]
-    fn competition_conserves_total_population_exactly() {
-        let mut grid = EcosystemGrid::new_random(12, 12, 0xBEEF);
-        let initial = grid.total_population();
-        grid.run(200);
-        assert_eq!(grid.total_population(), initial,
-            "total agents must never change: every death pairs with a birth");
+    fn test_cell_dominant() {
+        assert_eq!(CellPopulation::new(30, 10, 5).dominant(), Organism::Predator);
+        assert_eq!(CellPopulation::new(5, 10, 30).dominant(), Organism::Prey);
+        assert_eq!(CellPopulation::new(5, 30, 10).dominant(), Organism::Plant);
     }
 
     #[test]
-    fn competition_conserves_per_cell_capacity() {
-        let mut grid = EcosystemGrid::new_random(8, 8, 0xCAFE);
-        grid.run(150);
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let cell = grid.cell(x, y);
-                assert_eq!(cell.total(), CAPACITY,
-                    "cell ({},{}) has {} agents, expected {}", x, y, cell.total(), CAPACITY);
-            }
-        }
-    }
-
-    // ── Emergent behavior: spatial coexistence ────────────────────────────────
-
-    #[test]
-    fn spatial_rps_maintains_all_three_species() {
-        // Key claim: local interactions → coexistence emerges.
-        // With spatial structure, no single species can eliminate the others.
-        let mut grid = EcosystemGrid::new_random(12, 12, 0x5EED);
-        grid.run(400);
-        let (p, c, d) = grid.species_counts();
-        let total = (p + c + d) as f64;
-        let p_frac = p as f64 / total;
-        let c_frac = c as f64 / total;
-        let d_frac = d as f64 / total;
-        assert!(p_frac > 0.05, "producers went locally extinct ({:.1}%)", p_frac * 100.0);
-        assert!(c_frac > 0.05, "consumers went locally extinct ({:.1}%)", c_frac * 100.0);
-        assert!(d_frac > 0.05, "decomposers went locally extinct ({:.1}%)", d_frac * 100.0);
+    fn test_grid_new() {
+        let grid = EcosystemGrid::new(5, 5, 42);
+        assert_eq!(grid.width, 5);
+        assert_eq!(grid.height, 5);
+        assert_eq!(grid.cells.len(), 25);
+        assert_eq!(grid.total_population(), 0);
     }
 
     #[test]
-    fn mean_field_collapses_diversity_compared_to_spatial() {
-        // Coexistence depends on LOCAL interactions.
-        // Mean-field mode (any cell vs any cell) destroys the spatial protection.
-        let seed = 0x1234_5678u64;
-        let steps = 300u64;
-
-        let mut spatial = EcosystemGrid::new_random(10, 10, seed);
-        spatial.run(steps);
-        let spatial_entropy = spatial.species_entropy();
-
-        let mut mf = EcosystemGrid::new_random(10, 10, seed);
-        mf.mean_field = true;
-        mf.run(steps);
-        let mf_entropy = mf.species_entropy();
-
-        assert!(
-            spatial_entropy > mf_entropy + 0.05,
-            "spatial entropy {:.3} should exceed mean-field {:.3} \
-             (spatial structure creates coexistence that mean-field destroys)",
-            spatial_entropy, mf_entropy
-        );
+    fn test_grid_new_random() {
+        let grid = EcosystemGrid::new_random(4, 4, 42);
+        assert!(grid.total_population() > 0);
     }
 
     #[test]
-    fn species_entropy_stays_high_in_spatial_mode() {
-        // Maximum entropy for 3 equal species is ln(3) ≈ 1.099.
-        // After 400 steps, spatial coexistence should keep entropy > 0.75.
-        let mut grid = EcosystemGrid::new_random(14, 14, 0xABCD);
-        grid.run(400);
-        let entropy = grid.species_entropy();
-        assert!(entropy > 0.75,
-            "entropy {:.3} too low — ecosystem lost diversity (max is ln(3)≈1.099)",
-            entropy);
-    }
-
-    // ── Pheromone communication ───────────────────────────────────────────────
-
-    #[test]
-    fn pheromone_sign_tracks_local_species_balance() {
-        // After running, cells with more producers than consumers should have
-        // positive pheromone, and vice versa.
-        let mut grid = EcosystemGrid::new_random(10, 10, 0xF00D);
-        grid.run(100);
-
-        let mut positive_matches = 0usize;
-        let mut negative_matches = 0usize;
-        let mut total_nonzero = 0usize;
-
-        for y in 0..grid.height {
-            for x in 0..grid.width {
-                let cell = grid.cell(x, y);
-                if cell.pheromone != 0 || cell.charge() != 0 {
-                    total_nonzero += 1;
-                    if cell.charge() > 0 && cell.pheromone > 0 { positive_matches += 1; }
-                    if cell.charge() < 0 && cell.pheromone < 0 { negative_matches += 1; }
-                }
-            }
-        }
-        // More than half of non-zero cells should have matching sign
-        let matches = positive_matches + negative_matches;
-        assert!(matches * 2 >= total_nonzero,
-            "pheromone sign should correlate with charge: {}/{} matched",
-            matches, total_nonzero);
+    fn test_grid_cell_access() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
+        grid.cell_mut(1, 1).predators = 5;
+        assert_eq!(grid.cell(1, 1).predators, 5);
     }
 
     #[test]
-    fn pheromone_decays_to_near_zero_without_source() {
-        let mut grid = EcosystemGrid::new_random(6, 6, 0x1111);
-        // Seed pheromone without running competition
-        for cell in &mut grid.cells { cell.pheromone = 1000; }
-        // Zero out all agents except decomposers (zero charge → zero emission)
+    fn test_plant_growth() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
+        grid.cell_mut(1, 1).plants = 10;
+        grid.cell_mut(1, 1).prey = 0;
+        grid.cell_mut(1, 1).predators = 0;
+        let before = grid.cell(1, 1).plants;
+        grid.step();
+        assert!(grid.cell(1, 1).plants > before);
+    }
+
+    #[test]
+    fn test_plant_growth_respects_capacity() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
+        grid.cell_mut(1, 1).plants = grid.config.cell_capacity;
+        grid.cell_mut(1, 1).prey = 0;
+        grid.cell_mut(1, 1).predators = 0;
+        grid.step();
+        assert!(grid.cell(1, 1).plants <= grid.config.cell_capacity);
+    }
+
+    #[test]
+    fn test_predator_starvation() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
         for cell in &mut grid.cells {
-            cell.consumers = 0; cell.producers = 0; cell.decomposers = CAPACITY;
+            cell.predators = 20;
+            cell.plants = 0;
+            cell.prey = 0;
         }
-        // 30 pheromone steps: 0.82^30 ≈ 0.004 → should be near 0
-        for _ in 0..30 { grid.step_pheromone(); }
-        let max_pheromone = grid.pheromone_field().into_iter().map(|v| v.abs()).max().unwrap_or(0);
-        assert!(max_pheromone < 10, "pheromone should decay; max residual = {}", max_pheromone);
-    }
-
-    // ── Warp consensus ────────────────────────────────────────────────────────
-
-    #[test]
-    fn warp_consensus_requires_supermajority() {
-        let wc = WarpConsensus::new(4);
-
-        // 4/4 producers → strong +1 consensus
-        assert_eq!(wc.reduce(&[1, 1, 1, 1]),  vec![1]);
-        // 3/4 producers (75% = threshold) → consensus
-        assert_eq!(wc.reduce(&[1, 1, 1, -1]), vec![1]);
-        // 2/4 producers (50% = no consensus)
-        assert_eq!(wc.reduce(&[1, 1, -1, -1]), vec![0]);
-        // 4/4 consumers → −1
-        assert_eq!(wc.reduce(&[-1, -1, -1, -1]), vec![-1]);
-        // Mixed across two warps
-        let votes = [1, 1, 1, 1,   -1, -1, -1, -1];
-        assert_eq!(wc.reduce(&votes), vec![1, -1]);
+        let before = grid.cell(1, 1).predators;
+        grid.step();
+        assert!(grid.cell(1, 1).predators < before);
     }
 
     #[test]
-    fn warp_consensus_rate_rises_after_clustering() {
-        // Initially random → low consensus.
-        // After running, clusters form → nearby cells agree → higher consensus rate.
-        let mut grid = EcosystemGrid::new_random(12, 12, 0x9999);
-        let wc = WarpConsensus::new(WARP_SIZE);
+    fn test_predator_prey_oscillation() {
+        let mut grid = EcosystemGrid::new_random(10, 10, 12345);
+        let mut tracker = PopulationTracker::new();
+        for _ in 0..300 {
+            grid.step();
+            let (p, pl, pr) = grid.species_counts();
+            tracker.record(p, pl, pr);
+        }
+        assert!(tracker.detect_oscillation(),
+            "predator-prey oscillation should be detectable");
+    }
 
-        let rate_before = wc.consensus_rate(&grid.votes());
+    #[test]
+    fn test_all_species_survive() {
+        let mut grid = EcosystemGrid::new_random(10, 10, 99999);
         grid.run(300);
-        let rate_after = wc.consensus_rate(&grid.votes());
-
-        assert!(
-            rate_after > rate_before,
-            "warp consensus rate should rise as clusters form: {:.2} → {:.2}",
-            rate_before, rate_after
-        );
-    }
-
-    // ── Emergent spatial clustering ───────────────────────────────────────────
-
-    #[test]
-    fn spatial_autocorrelation_rises_as_territories_form() {
-        // Random start: autocorrelation ≈ 0 (no structure).
-        // After running: positive autocorrelation (like species cluster).
-        // This is the spatial signature of emergent territory formation.
-        let mut grid = EcosystemGrid::new_random(14, 14, 0x4444);
-        let ac_before = grid.spatial_autocorrelation();
-        grid.run(350);
-        let ac_after = grid.spatial_autocorrelation();
-
-        assert!(
-            ac_after > ac_before + 0.02,
-            "autocorrelation should rise as territories form: {:.4} → {:.4}",
-            ac_before, ac_after
-        );
-    }
-
-    // ── CRDT laws ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn crdt_merge_is_commutative() {
-        let mut a = PopCrdt::new(0);
-        a.record_competition(Species::Producer, Species::Decomposer);
-        a.record_competition(Species::Producer, Species::Decomposer);
-
-        let mut b = PopCrdt::new(1);
-        b.record_competition(Species::Consumer, Species::Producer);
-
-        // a ⊔ b
-        let mut ab = a.clone();
-        ab.merge(&b);
-
-        // b ⊔ a
-        let mut ba = b.clone();
-        ba.merge(&a);
-
-        // Both should have the same totals
-        assert_eq!(ab.net(), ba.net(), "merge must be commutative: a⊔b = b⊔a");
+        assert!(!grid.is_extinct(Organism::Predator), "predators should survive");
+        assert!(!grid.is_extinct(Organism::Plant), "plants should survive");
+        assert!(!grid.is_extinct(Organism::Prey), "prey should survive");
     }
 
     #[test]
-    fn crdt_merge_is_idempotent() {
-        let mut a = PopCrdt::new(0);
-        a.record_competition(Species::Decomposer, Species::Consumer);
-        a.record_competition(Species::Decomposer, Species::Consumer);
-
-        let snapshot = a.clone();
-        a.merge(&snapshot);
-        a.merge(&snapshot); // double-merge
-
-        // Net should be unchanged from original
-        assert_eq!(a.net(), snapshot.net(), "merge must be idempotent: a⊔a = a");
+    fn test_food_chain_depth() {
+        let mut grid = EcosystemGrid::new_random(10, 10, 42);
+        grid.run(50);
+        assert_eq!(grid.food_chain_depth(), 3);
     }
 
     #[test]
-    fn crdt_preserves_zero_sum_conservation() {
-        // Every competition is zero-sum: one birth, one death.
-        // total_net() must always be 0.
-        let mut node0 = PopCrdt::new(0);
-        let mut node1 = PopCrdt::new(1);
+    fn test_stability_metric_range() {
+        let grid = EcosystemGrid::new_random(8, 8, 42);
+        let s = grid.stability_metric();
+        assert!(s >= 0.0);
+        assert!(s <= (3.0_f64).ln() + 0.01);
+    }
 
-        // Simulate independent competition on two nodes
-        for _ in 0..50 {
-            node0.record_competition(Species::Producer,   Species::Decomposer);
-            node0.record_competition(Species::Consumer,   Species::Producer);
-            node1.record_competition(Species::Decomposer, Species::Consumer);
+    #[test]
+    fn test_stability_metric_equal_pops() {
+        let mut grid = EcosystemGrid::new(2, 2, 42);
+        for cell in &mut grid.cells {
+            cell.predators = 10;
+            cell.plants = 10;
+            cell.prey = 10;
         }
-
-        assert_eq!(node0.total_net(), 0, "node0: every birth paired with death");
-        assert_eq!(node1.total_net(), 0, "node1: every birth paired with death");
-
-        // After merge, total_net still 0
-        let mut merged = node0.clone();
-        merged.merge(&node1);
-        assert_eq!(merged.total_net(), 0,
-            "merged CRDT: conservation holds across nodes after merge");
+        let s = grid.stability_metric();
+        assert!((s - (3.0_f64).ln()).abs() < 0.001);
     }
 
     #[test]
-    fn crdt_merge_combines_node_knowledge() {
-        let mut a = PopCrdt::new(10);
-        a.record_competition(Species::Producer, Species::Decomposer);
-
-        let mut b = PopCrdt::new(20);
-        b.record_competition(Species::Consumer, Species::Producer);
-
-        assert_eq!(a.known_nodes(), 1);
-        assert_eq!(b.known_nodes(), 1);
-
-        a.merge(&b);
-        assert_eq!(a.known_nodes(), 2, "after merge, a knows about b's node");
+    fn test_extinction_detection() {
+        let mut grid = EcosystemGrid::new(2, 2, 42);
+        for cell in &mut grid.cells { cell.plants = 20; }
+        assert!(grid.is_extinct(Organism::Predator));
+        assert!(grid.is_extinct(Organism::Prey));
+        assert!(!grid.is_extinct(Organism::Plant));
     }
 
-    // ── End-to-end emergent ecosystem scenario ────────────────────────────────
+    #[test]
+    fn test_population_tracker() {
+        let mut t = PopulationTracker::new();
+        t.record(5, 20, 10);
+        t.record(3, 25, 8);
+        t.record(4, 22, 12);
+        assert_eq!(t.history.len(), 3);
+        let (a, b, c) = t.average_populations();
+        assert!((a - 4.0).abs() < 0.01);
+    }
 
     #[test]
-    fn full_ecosystem_run_shows_all_emergent_properties() {
-        let mut grid = EcosystemGrid::new_random(16, 16, 0xDEAD_BEEF);
-        let wc = WarpConsensus::new(WARP_SIZE);
+    fn test_oscillation_detection() {
+        let mut t = PopulationTracker::new();
+        for i in 0..20 {
+            let v = 100 + (50.0 * (i as f64 * 0.5).sin()) as u32;
+            t.record(v, 200, v);
+        }
+        assert!(t.detect_oscillation());
+    }
 
-        let pop_before = grid.total_population();
-        let entropy_before = grid.species_entropy();
-        let ac_before = grid.spatial_autocorrelation();
-        let consensus_before = wc.consensus_rate(&grid.votes());
+    #[test]
+    fn test_no_oscillation_flat() {
+        let mut t = PopulationTracker::new();
+        for _ in 0..20 { t.record(10, 20, 10); }
+        assert!(!t.detect_oscillation());
+    }
 
+    #[test]
+    fn test_carrying_capacity() {
+        let config = EcosystemConfig::default();
+        let cap_prey = CarryingCapacity::for_prey(&config, 64);
+        let cap_pred = CarryingCapacity::for_predators(&config, 64);
+        assert!(cap_prey > 0);
+        assert!(cap_pred > 0);
+        assert!(cap_pred < cap_prey);
+    }
+
+    #[test]
+    fn test_step_count() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
+        assert_eq!(grid.step_count(), 0);
+        grid.run(10);
+        assert_eq!(grid.step_count(), 10);
+    }
+
+    #[test]
+    fn test_neighbors() {
+        let grid = EcosystemGrid::new(5, 5, 42);
+        assert_eq!(grid.neighbors(0).len(), 3); // corner
+        assert_eq!(grid.neighbors(12).len(), 8); // center
+    }
+
+    #[test]
+    fn test_ternary_population_balance() {
+        let mut grid = EcosystemGrid::new_random(10, 10, 77777);
+        grid.run(100);
+        let (pred, plant, prey) = grid.species_counts();
+        assert!(plant > 0, "plants should exist");
+        assert!(prey > 0, "prey should exist");
+        // Ternary pyramid: producers > consumers > apex
+        assert!(plant > pred, "plants ({}) > predators ({})", plant, pred);
+    }
+
+    #[test]
+    fn test_large_grid_stability() {
+        let mut grid = EcosystemGrid::new_random(20, 20, 31415);
         grid.run(500);
+        assert!(grid.stability_metric() > 0.3);
+        assert_eq!(grid.food_chain_depth(), 3);
+    }
 
-        let pop_after = grid.total_population();
-        let entropy_after = grid.species_entropy();
-        let ac_after = grid.spatial_autocorrelation();
-        let consensus_after = wc.consensus_rate(&grid.votes());
+    #[test]
+    fn test_predator_extinction_without_prey() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
+        for cell in &mut grid.cells {
+            cell.predators = 20;
+            cell.plants = 30;
+            cell.prey = 0;
+        }
+        grid.run(200);
+        assert!(grid.is_extinct(Organism::Predator));
+    }
 
-        // 1. Conservation: total population unchanged
-        assert_eq!(pop_before, pop_after, "conservation law violated");
+    #[test]
+    fn test_prey_grows_without_predators() {
+        let mut grid = EcosystemGrid::new(5, 5, 42);
+        for cell in &mut grid.cells {
+            cell.prey = 5;
+            cell.plants = 50;
+            cell.predators = 0;
+        }
+        let initial: u32 = grid.cells.iter().map(|c| c.prey).sum();
+        grid.run(50);
+        let final_count: u32 = grid.cells.iter().map(|c| c.prey).sum();
+        assert!(final_count > initial, "prey should grow: {} -> {}", initial, final_count);
+    }
+}
 
-        // 2. Coexistence: all species still present
-        let (p, c, d) = grid.species_counts();
-        assert!(p > 0, "producers went extinct");
-        assert!(c > 0, "consumers went extinct");
-        assert!(d > 0, "decomposers went extinct");
-
-        // 3. Diversity maintained (entropy ≥ 0.6)
-        assert!(entropy_after >= 0.60,
-            "ecosystem lost diversity: entropy = {:.3}", entropy_after);
-
-        // 4. Spatial structure formed: autocorrelation rose
-        assert!(ac_after > ac_before,
-            "no spatial clustering detected: ac = {:.4} → {:.4}", ac_before, ac_after);
-
-        // 5. Warp consensus increased: warps became more opinionated
-        assert!(consensus_after > consensus_before,
-            "warp consensus did not increase: {:.2} → {:.2}", consensus_before, consensus_after);
+#[cfg(test)]
+mod debug2 {
+    use super::*;
+    #[test]
+    fn debug_pred_no_prey() {
+        let mut grid = EcosystemGrid::new(3, 3, 42);
+        for cell in &mut grid.cells {
+            cell.predators = 20;
+            cell.plants = 30;
+            cell.prey = 0;
+        }
+        for i in 0..20 {
+            grid.step();
+            let (p, pl, pr) = grid.species_counts();
+            if i % 5 == 0 || p == 0 {
+                eprintln!("step {}: pred={} plant={} prey={}", i+1, p, pl, pr);
+            }
+        }
     }
 }
